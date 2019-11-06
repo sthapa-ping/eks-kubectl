@@ -1,0 +1,187 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CDE Factory - Creates EKS Worker Nodes
+
+Parameters:
+  ClusterName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/customer-account-factory/cluster-name
+  ControlPlaneSecurityGroupId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/customer-account-factory/control-plane-security-group-id
+  EnvironmentName:
+    Type: String
+    Description: The globally unique name of the environment to be created
+  NetworkStack:
+    Description: vpc cloudformation stack name
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/customer-account-factory/network-stack
+  SmallRegion:
+    Description: If "true", deploy across two AZ's instead of three
+    Type: String
+    Default: "false"
+    AllowedValues: [true, false]
+  Version:
+    Type: String
+    Description: The version commit shorthash representing the factory version
+  # Worker Node Scaling settings
+  InstanceType:
+    Description: EC2 instance type for the EKS worker node
+    Type: String
+    Default: t2.medium
+  MinimumInstanceCount:
+    Description: The minimum number of EKS worker nodes required in the
+      cluster group
+    Type: String
+    Default: "2"
+  MaximumInstanceCount:
+    Description: The maximum number of EKS worker nodes allowable in the
+      cluster group
+    Type: String
+    Default: "2"
+  AmiId:
+    Description: AMI Id of the image for the worker node instances
+    Type: AWS::EC2::Image::Id
+
+Conditions:
+  CreateWorkerNodeAutoScalingGroupC: !Equals [ !Ref SmallRegion, false ]
+
+Resources:
+
+  WorkerNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group which used by the Worker Nodes
+      VpcId:
+        Fn::ImportValue: !Sub ${NetworkStack}-VPCID
+      Tags:
+        - Key: !Sub "kubernetes.io/cluster/${ClusterName}"
+          Value: 'owned'
+
+  WorkerNodeSecurityGroupIngressHTTPS:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WorkerNodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref WorkerNodeSecurityGroup
+
+  WorkerNodeSecurityGroupIngressInstanceInterWorkerCommunication:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WorkerNodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref WorkerNodeSecurityGroup
+
+  WorkerNodeSecurityGroupFromControlPlaneIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow kubelets and pods to receive communication from the control plane
+      GroupId: !Ref WorkerNodeSecurityGroup
+      SourceSecurityGroupId: !Ref ControlPlaneSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+
+  ControlPlaneEgressToWorkerNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: WorkerNodeSecurityGroup
+    Properties:
+      Description: Allow the control plane to communicate with worker kubelet and pods
+      GroupId: !Ref ControlPlaneSecurityGroupId
+      DestinationSecurityGroupId: !Ref WorkerNodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+
+  WorkerNodeSecurityGroupFromControlPlaneOn443Ingress:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: WorkerNodeSecurityGroup
+    Properties:
+      Description: Allow pods running extension API servers on port 443 to receive communication from control plane
+      GroupId: !Ref WorkerNodeSecurityGroup
+      SourceSecurityGroupId: !Ref ControlPlaneSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+
+  ControlPlaneEgressToWorkerNodeSecurityGroupOn443:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: WorkerNodeSecurityGroup
+    Properties:
+      Description: Allow the cluster control plane to communicate with pods running extension API servers on port 443
+      GroupId: !Ref ControlPlaneSecurityGroupId
+      DestinationSecurityGroupId: !Ref WorkerNodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+
+  ControlPlaneSecurityGroupIdIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: WorkerNodeSecurityGroup
+    Properties:
+      Description: Allow pods to communicate with the cluster API Server
+      GroupId: !Ref ControlPlaneSecurityGroupId
+      SourceSecurityGroupId: !Ref WorkerNodeSecurityGroup
+      IpProtocol: tcp
+      ToPort: 443
+      FromPort: 443
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Policies:
+        - PolicyName: AutoScalingPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'autoscaling:DescribeAutoScalingGroups'
+                  - 'autoscaling:DescribeAutoScalingInstances'
+                  - 'autoscaling:DescribeLaunchConfigurations'
+                  - 'autoscaling:DescribeTags'
+                  - 'autoscaling:SetDesiredCapacity'
+                  - 'autoscaling:TerminateInstanceInAutoScalingGroup'
+                Resource:
+                - !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*"
+              - Effect: Allow
+                Action:
+                  - ecr:*
+                  - s3:*
+                  - route53:*
+                  - logs:*
+                Resource:
+                  - '*'
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref InstanceRole
+
+  InstanceRoleParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/eks/${EnvironmentName}/worker-node-instance-role"
+      Type: String
+      Value: !GetAtt InstanceRole.Arn
+      Description: Instance Role used by the Worker Node instance

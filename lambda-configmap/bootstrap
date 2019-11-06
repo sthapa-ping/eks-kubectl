@@ -1,0 +1,63 @@
+#!/bin/sh
+
+# Set Path
+export PATH=$PATH:/opt/awscli:/opt/kubectl
+
+while true
+do
+  HEADERS="$(mktemp)"
+  # Get an event
+  EVENT_DATA=$(curl -sS -LD "$HEADERS" -X GET "http://${AWS_LAMBDA_RUNTIME_API}/2018-06-01/runtime/invocation/next")
+  REQUEST_ID=$(grep -Fi Lambda-Runtime-Aws-Request-Id "$HEADERS" | tr -d '[:space:]' | cut -d: -f2)
+
+  # Execute the handler function from the script
+  RESPONSE=$(./$(echo "$_HANDLER" | cut -d. -f2).sh "$EVENT_DATA")
+  EXIT_CODE=$?
+
+  if [[ $EXIT_CODE -eq "0" ]]; then
+    Status='SUCCESS'
+  else
+    Status='FAILED'
+  fi
+
+  ResponseURL=$(echo $EVENT_DATA | jq -r '.ResponseURL | select(type == "string")')
+  StackId=$(echo $EVENT_DATA | jq -r '.StackId | select(type == "string")')
+  RequestId=$(echo $EVENT_DATA | jq -r '.RequestId | select(type == "string")')
+  LogicalResourceId=$(echo $EVENT_DATA | jq -r '.LogicalResourceId | select(type == "string")')
+  PhysicalResourceId=$(echo $EVENT_DATA | jq -r '.PhysicalResourceId | select(type == "string")')
+
+  if [ -n "${PhysicalResourceId}" ]; then
+    echo "PhysicalResourceId: $PhysicalResourceId"
+  else
+    STACK_NAME=$(echo $StackId | cut -d '/' -f1)
+    RANDOM_STR=$(uuidgen | tr -d '-' |  tr '[:lower:]' '[:upper:]' | cut -c 1-14)
+    PhysicalResourceId="$STACK_NAME-$LogicalResourceId-$RANDOM_STR"
+    echo "New PhysicalResourceId: $PhysicalResourceId"
+  fi
+
+  RESPONSE_PAYLOAD='{
+    "Status": "'"$Status"'",
+    "PhysicalResourceId": "'"$PhysicalResourceId"'",
+    "StackId": "'"$StackId"'",
+    "RequestId": "'"$RequestId"'",
+    "LogicalResourceId": "'"$LogicalResourceId"'"
+  }'
+
+  echo "=========[EVENT_DATA]======="
+  echo "$EVENT_DATA"
+  echo "=========[/EVENT_DATA]======="
+
+  echo "=========[RESPONSE]======="
+  echo "$RESPONSE"
+  echo "=========[/RESPONSE]======="
+
+  echo "=========[RESPONSE_PAYLOAD]======="
+  echo "$RESPONSE_PAYLOAD"
+  echo "=========[/RESPONSE_PAYLOAD]======="
+
+  # Send response to cfn
+  curl $ResponseURL -H "Content-Type: ''" -X PUT -d "$RESPONSE_PAYLOAD"
+
+  # Send the response
+  curl -X POST "http://${AWS_LAMBDA_RUNTIME_API}/2018-06-01/runtime/invocation/$REQUEST_ID/response"  -d "$RESPONSE"
+done

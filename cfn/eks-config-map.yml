@@ -1,0 +1,111 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CDE Factory - Creates lambda function to update k8s config map
+
+Parameters:
+  LambdaLayerS3Bucket:
+    Type: String
+  LambdaLayerS3Key:
+    Type: String
+    Default: dependencies/lambda-function-configmap-version-1.zip
+  ControlPlaneUserRole:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/customer-account-factory/control-plane-user-role-arn
+  LambdaLayerArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/customer-account-factory/lambda-layer-kubectl
+  ClusterName:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/customer-account-factory/cluster-name
+  NetworkStack:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/customer-account-factory/network-stack
+  ControlPlaneSecurityGroupId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/customer-account-factory/control-plane-security-group-id
+  WorkerNodeIamRoleArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/test/worker-node-instance-role
+  FunctionName:
+    Type: String
+    Default: ConfigMapFunction
+
+Resources:
+  KubectlSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group which used by the lambda function
+      VpcId:
+        Fn::ImportValue: !Sub ${NetworkStack}-VPCID
+
+  ControlPlaneEgressToKubectlSecurityGroupOn443:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: KubectlSecurityGroup
+    Properties:
+      Description: Allow the cluster control plane to communicate with pods running extension API servers on port 443
+      GroupId: !Ref ControlPlaneSecurityGroupId
+      DestinationSecurityGroupId: !Ref KubectlSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+
+  ControlPlaneSecurityGroupIdIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: KubectlSecurityGroup
+    Properties:
+      Description: Allow pods to communicate with the cluster API Server
+      GroupId: !Ref ControlPlaneSecurityGroupId
+      SourceSecurityGroupId: !Ref KubectlSecurityGroup
+      IpProtocol: tcp
+      ToPort: 443
+      FromPort: 443
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Handler: main
+      Runtime: provided
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref KubectlSecurityGroup
+        SubnetIds:
+            - Fn::ImportValue: !Sub "${NetworkStack}-SubnetPrivateA"
+            - Fn::ImportValue: !Sub "${NetworkStack}-SubnetPrivateB"
+            - Fn::ImportValue: !Sub "${NetworkStack}-SubnetPrivateC"
+      Layers:
+        - !Ref LambdaLayerArn
+      Code:
+        S3Bucket: !Ref LambdaLayerS3Bucket
+        S3Key: !Ref LambdaLayerS3Key
+      MemorySize: 512
+      Environment:
+        Variables:
+          cluster_name: !Ref ClusterName
+      Role: !Ref ControlPlaneUserRole
+      Timeout: 60
+
+  InvokeConfigMap:
+    DependsOn: LambdaFunction
+    Type: Custom::InvokeConfigMap
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      cluster_name: !Ref ClusterName
+      iam_role_arn: !Ref WorkerNodeIamRoleArn
+
+
+Outputs:
+  LambdaFuncArn:
+    Description: Lambda Func ARN
+    Value: !GetAtt LambdaFunction.Arn
+    Export:
+      Name: !Sub 'LambdaFuncArn-${AWS::StackName}'
+  LambdaFuncName:
+    Description: Lambda Func Name
+    Value: !Ref LambdaFunction
+    Export:
+      Name: !Sub 'LambdaFuncName-${AWS::StackName}'
+  LambdaRoleArn:
+    Description: Lambda Role ARN
+    Value: !Sub "arn:aws:iam::${AWS::AccountId}:role/LambdaEKSAdminRole"
+    Export:
+      Name: !Sub 'LambdaRoleArn-${AWS::StackName}'

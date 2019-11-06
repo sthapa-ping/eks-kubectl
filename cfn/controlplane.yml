@@ -1,0 +1,187 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Customer Factory - Creates EKS control plane
+
+Parameters:
+  ControlPlaneFunctionName:
+    Type: String
+    Default: ControlPlaneFunction
+  ControlPlaneSecurityGroup:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/customer-account-factory/control-plane-security-group-id
+  ControlPlaneServiceRole:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/customer-account-factory/control-plane-service-role-arn
+  ControlPlaneUserRole:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/customer-account-factory/control-plane-user-role-arn
+  ClusterName:
+    Type: String
+  ClusterEndpointPublicAccess:
+    Type: String
+    Default: 'False'
+    AllowedValues:
+      - 'True'
+      - 'False'
+  ClusterVersion:
+    Type: String
+    Default: 1.14
+  EnableClusterLog:
+    Type: String
+    Default: 'True'
+    AllowedValues:
+      - 'True'
+      - 'False'
+  NetworkStack:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /eks/customer-account-factory/network-stack
+
+Resources:
+  SSMClusterName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: EKS cluster name.
+      Type: String
+      Name: '/eks/customer-account-factory/cluster-name'
+      Value: !Ref ClusterName
+
+  ControlPlane:
+    Type: Custom::ControlPlane
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      cluster_name: !Ref ClusterName
+      cluster_log: !Ref EnableClusterLog
+      control_plane_service_role: !Ref ControlPlaneServiceRole
+      control_plane_security_group: !Ref ControlPlaneSecurityGroup
+      endpoint_public_access: !Ref ClusterEndpointPublicAccess
+      version: !Ref ClusterVersion
+      subnet_ids:
+        !Join
+          - ','
+          - - Fn::ImportValue: !Sub "${NetworkStack}-SubnetPrivateA"
+            - Fn::ImportValue: !Sub "${NetworkStack}-SubnetPrivateB"
+            - Fn::ImportValue: !Sub "${NetworkStack}-SubnetPrivateC"
+            - Fn::ImportValue: !Sub "${NetworkStack}-SubnetPublicA"
+            - Fn::ImportValue: !Sub "${NetworkStack}-SubnetPublicB"
+            - Fn::ImportValue: !Sub "${NetworkStack}-SubnetPublicC"
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref ControlPlaneFunctionName
+      Handler: index.lambda_handler
+      Role: !Ref ControlPlaneUserRole
+      Code:
+        ZipFile: !Sub |
+          #!/usr/bin/env python
+          """ CloudFormation Lambda-backed custom resource to create the eks control plane. """
+          import json
+          import boto3
+          import logging
+          import cfnresponse
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+          eks_client = boto3.client('eks')
+
+
+          def create_cluster(data, vpc_config, logging):
+            response = eks_client.create_cluster(
+                name = data['cluster_name'],
+                version = data['version'],
+                roleArn = data['control_plane_service_role'],
+                resourcesVpcConfig = vpc_config,
+                logging = logging
+            )
+
+            log.info(f'Create: {response}')
+
+            return response
+
+
+          def update_cluster(data):
+            response = eks_client.update_cluster_config(
+                name = data['cluster_name'],
+                resourcesVpcConfig = {
+                  'endpointPublicAccess': eval(data['endpoint_public_access'])
+                }
+            )
+
+            log.info(f'Update: {response}')
+
+            return response
+
+
+          def delete_cluster(data):
+            response = eks_client.delete_cluster(
+                name = data['cluster_name']
+            )
+
+            log.info(f'Delete: {response}')
+
+            return response
+
+
+          def lambda_handler(event, context):
+              log.info(f'Request: {event}')
+              status = 'SUCCESS'
+              response_data = {}
+              physical_resource_id = {}
+
+              try:
+                data = event['ResourceProperties']
+                response_data = {'Message' : data}
+                logging = {
+                  'clusterLogging': [
+                    {
+                      'types': [
+                        'api',
+                        'audit',
+                        'authenticator',
+                        'controllerManager',
+                        'scheduler'
+                      ],
+                      'enabled': eval(data['cluster_log'])
+                    },
+                  ]
+                }
+                vpc_config = {
+                    'subnetIds': data['subnet_ids'].split(','),
+                    'securityGroupIds': data['control_plane_security_group'].split(','),
+                    'endpointPublicAccess': eval(data['endpoint_public_access']),
+                    'endpointPrivateAccess': True
+                }
+
+
+                if event['RequestType'] == 'Create':
+                  create_cluster(data, vpc_config, logging)
+
+                if event['RequestType'] == 'Update':
+                  try:
+                    update_cluster(data)
+                  except Exception:
+                    # Return success response to cfn to avoid rollback from triggering Delete request type.
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physical_resource_id)
+                    log.exception("Failed to update cluster config, check cloudwatch logs for details!")
+
+                    return
+
+                if event['RequestType'] == 'Delete':
+                  delete_cluster(data)
+
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physical_resource_id)
+                return
+              except Exception:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data, physical_resource_id)
+                  log.exception("Lambda execution has failed!")
+
+                  return
+
+      Runtime: python3.7
+      MemorySize: 128
+      Timeout: 60
+
+Outputs:
+  VpcId:
+    Value:
+      Fn::ImportValue: !Sub "${NetworkStack}-VPCID"
